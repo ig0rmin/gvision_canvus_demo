@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,68 +9,18 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path"
 	"strings"
 	"time"
+
+	vision "cloud.google.com/go/vision/apiv1"
 )
 
 const (
-	serverURL = "http://localhost:8090/api/v1"
-	authToken = "8W5zQ8nrSHe4NdBG"
-	canvasId  = "e90af7cf-2164-4ce3-b831-3fbb7d1449ae"
+	serverURL      = "http://localhost:8090/api/v1"
+	authToken      = "8W5zQ8nrSHe4NdBG"
+	canvasId       = "e90af7cf-2164-4ce3-b831-3fbb7d1449ae"
+	gvisionKeyFile = "/home/igor/SRC2/gvision_keys.json"
 )
-
-/*
-func readStreamingEndpoint(url string, output chan<- interface{}) {
-	defer close(output)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		log.Printf("%v", err.Error())
-		return
-	}
-	req.Header.Add("Private-Token", authToken)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("%v", err.Error())
-		return
-	}
-
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("%v response is %v\n", url, resp.StatusCode)
-		return
-	}
-
-	var buff [1]byte
-	var line []byte
-Loop:
-	for {
-		n, err := resp.Body.Read(buff[:])
-		if err != nil {
-			//log.Printf("Got error %v on Read call", err.Error())
-			break Loop
-		}
-		if n == 0 {
-			//log.Printf("Get zero read on Read call")
-			continue Loop
-		}
-		if buff[0] == '\n' && len(line) > 0 {
-			var js interface{}
-			err := json.Unmarshal(line, &js)
-			if err != nil {
-				log.Printf("Received invalid JSON from the endpoint. Error: %v\n", err.Error())
-				break Loop
-			}
-			output <- js
-			line = nil
-		} else if buff[0] != '\n' {
-			line = append(line, buff[0])
-		}
-	}
-
-	log.Println("Read endpoint loop done")
-}*/
 
 type apiCallError struct {
 	code int
@@ -132,8 +82,8 @@ Loop:
 }
 
 type WidgetSize struct {
-	Height int `json:"height"`
-	Width  int `json:"width"`
+	Height float64 `json:"height"`
+	Width  float64 `json:"width"`
 }
 
 type CanvasImage struct {
@@ -144,16 +94,35 @@ type CanvasImage struct {
 	Size       WidgetSize `json:"size"`
 }
 
+type CanvasNote struct {
+	WidgetId        string `json:"id"`
+	ParentId        string `json:"parent_id"`
+	WidgetType      string `json:"widget_type"`
+	State           string `json:"state"`
+	Text            string `json:"text"`
+	BackgroundColor string `json:"background_color"`
+}
+
 type ImageStatus struct {
 	image     CanvasImage
 	annotated bool
 }
 
+type ImageAnnotation struct {
+	image *CanvasImage
+	text  string
+}
+
 var gImageDB map[string]*ImageStatus
+var gVisonQueue chan *CanvasImage
+var gAnnotationQueue chan *ImageAnnotation
 
 func updateImageStatus(imageStatus *ImageStatus) {
 	image := imageStatus.image
 	if len(image.Hash) == 0 {
+		return
+	}
+	if imageStatus.annotated {
 		return
 	}
 	go annotateImage(image)
@@ -190,10 +159,8 @@ func updateImageDB(image CanvasImage) {
 		updateImageStatus(imageStatus)
 	} else {
 		if imageAlive {
-			if !imageStatus.annotated {
-				imageStatus.image = image
-				updateImageStatus(imageStatus)
-			}
+			imageStatus.image = image
+			updateImageStatus(imageStatus)
 		} else {
 			delete(gImageDB, image.WidgetId)
 		}
@@ -207,7 +174,7 @@ func processRawJsonStream(input <-chan []byte) {
 			return
 		}
 		imageList := make([]CanvasImage, 0, 1)
-		log.Printf("Raw json: %s", rawJson)
+		//log.Printf("Raw json: %s", rawJson)
 		err := json.Unmarshal(rawJson, &imageList)
 		if err != nil {
 			log.Print(err.Error())
@@ -219,108 +186,136 @@ func processRawJsonStream(input <-chan []byte) {
 	}
 }
 
-func doMainLoop() {
-	url := serverURL + "/canvases/" + canvasId + "/images?subscribe"
-	for {
-		rawJsonStream := make(chan []byte)
-		go processRawJsonStream(rawJsonStream)
-		err := readStreamingEndpoint(url, rawJsonStream)
-		if apiErr, ok := err.(apiCallError); ok {
-			log.Print(apiErr.Error())
-			return // User needs to change config
-		}
-		// The network error, sleep and try again
-		const timeout = 3 * time.Second
-		log.Printf("Error %v, reconnect after %s", err.Error(), timeout)
-		time.Sleep(timeout)
-	}
-}
-
-func downloadImage(imageId string, originalName string) {
-	const (
-		downloadDir = "/home/igor/Desktop/api_downloads"
-	)
-
-	if stat, err := os.Stat(downloadDir); err != nil || !stat.IsDir() {
-		log.Printf("Downloads folder %v does not exists or cannot be accessed %v\n", downloadDir, err)
-		return
-	}
-
-	ext := path.Ext(originalName)
-	if len(ext) == 0 {
-		ext = ".jpg" // Make a guess
-	}
-
-	fullPath := path.Join(downloadDir, imageId+ext)
-	if _, err := os.Stat(fullPath); !os.IsNotExist(err) {
-		log.Printf("Skip existing file %v\n", fullPath)
-		return
-	} else {
-		log.Printf("Going to download %v\n", fullPath)
-	}
-
+func getImageDataStream(imageId string) (io.ReadCloser, error) {
 	endpoint := serverURL + "/canvases/" + canvasId + "/images/" + imageId + "/download"
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
-		log.Printf("%v\n", err.Error())
-		return
+		return nil, err
 	}
 	req.Header.Add("Private-Token", authToken)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("%v\n", err.Error())
-		return
+		return nil, err
 	}
 
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("%v response is %v\n", endpoint, resp.StatusCode)
-		return
+		return nil, fmt.Errorf("%v response is %v\n", endpoint, resp.StatusCode)
 	}
 
-	outFile, err := os.Create(fullPath)
+	return resp.Body, nil
+}
+
+var currentColor int
+var magicColors []string = []string{
+	"#ccff66",
+	"#99ff66",
+	"#66ff99",
+	"#99ccff",
+}
+
+func getMagicColor() string {
+	currentColor++
+	return magicColors[currentColor%len(magicColors)]
+}
+
+func isMagicColor(color string) bool {
+	for _, magic := range magicColors {
+		if strings.EqualFold(color, magic) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkAnnnotations(image CanvasImage) (bool, error) {
+	url := serverURL + "/canvases/" + canvasId + "/notes"
+
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		log.Printf("Cannot create output file, error: %v\n", err)
-		return
+		return false, err
 	}
+	req.Header.Add("Private-Token", authToken)
 
-	outWriter := bufio.NewWriter(outFile)
-
-	written, err := io.Copy(outWriter, resp.Body)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("Error while copying download data to output: %v\n", err)
-		return
-	} else {
-		log.Printf("Written %v bytes\n", written)
+		return false, err
 	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("Status code is %v, response: %s", resp.StatusCode, body)
+	}
+
+	var notes []CanvasNote
+	err = json.Unmarshal(body, &notes)
+	if err != nil {
+		return false, err
+	}
+
+	for _, note := range notes {
+		if note.ParentId == image.WidgetId && isMagicColor(note.BackgroundColor) {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 func annotateImage(image CanvasImage) {
-	url := serverURL + "/canvases/" + canvasId + "/notes"
-	_ = url
+	log.Printf("Check image %s", image.WidgetId)
+	annotated, err := checkAnnnotations(image)
+	if err != nil {
+		log.Printf("Can't get info about existing annotations: %s", err.Error())
+		return
+	}
+	if annotated {
+		log.Printf("Image is already annotated")
+		return
+	}
 
-	pos_x := image.Size.Width - 150
+	gVisonQueue <- &image
+}
+
+func attachNote(image *CanvasImage, noteColor string, noteText string) {
+	url := serverURL + "/canvases/" + canvasId + "/notes"
+
+	note_side := 300.0
+	note_scale := (image.Size.Height / 4.5) / note_side
+
+	pos_x := image.Size.Width - (note_side/2)*note_scale
 	if pos_x < 0 {
 		pos_x = image.Size.Width
 	}
-	pos_y := image.Size.Height - 400
+	pos_y := image.Size.Height - (note_side*1.33)*note_scale
 	if pos_y < 0 {
 		pos_y = image.Size.Height
 	}
 
 	note := fmt.Sprintf(`{
 		"parent_id" : "%s",
-		"text": "Hello from API",
+		"text": "%s",
 		"depth": 1,
-		"background_color" : "#99ff33",
+		"background_color" : "%s",
+		"size": {
+			"width": %v,
+			"height": %v
+		},
 		"location": {
 			"x": %v,
 			"y": %v
-		}
-	}`, image.WidgetId, pos_x, pos_y)
+		},
+		"scale" : %v
+	}`, image.WidgetId,
+		noteText,
+		noteColor,
+		note_side,
+		note_side,
+		pos_x,
+		pos_y, note_scale)
 
-	log.Printf("Gonna annotate with JSON: %s", note)
+	//log.Printf("Gonna annotate with JSON: %s", note)
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(note))
 	if err != nil {
@@ -346,7 +341,98 @@ func annotateImage(image CanvasImage) {
 	log.Printf("Annotated %s", image.WidgetId)
 }
 
+func annotationLoop() {
+Loop:
+	for {
+		annotation, ok := <-gAnnotationQueue
+		if !ok {
+			break Loop
+		}
+
+		attachNote(annotation.image, getMagicColor(), annotation.text)
+	}
+}
+
+func gvisionLoop() {
+	ctx := context.Background()
+
+	// Creates a client.
+	client, err := vision.NewImageAnnotatorClient(ctx)
+	if err != nil {
+		log.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+Loop:
+	for {
+		canvasImage, ok := <-gVisonQueue
+		if !ok {
+			break Loop
+		}
+		data, err := getImageDataStream(canvasImage.WidgetId)
+		if err != nil {
+			gAnnotationQueue <- &ImageAnnotation{
+				image: canvasImage,
+				text:  fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
+			}
+			continue Loop
+		}
+		defer data.Close()
+		image, err := vision.NewImageFromReader(data)
+		if err != nil {
+			gAnnotationQueue <- &ImageAnnotation{
+				image: canvasImage,
+				text:  fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
+			}
+			continue Loop
+		}
+
+		labels, err := client.DetectLabels(ctx, image, nil, 10)
+		if err != nil {
+			gAnnotationQueue <- &ImageAnnotation{
+				image: canvasImage,
+				text:  fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
+			}
+			continue Loop
+		}
+
+		var descriptions []string
+		for _, label := range labels {
+			descriptions = append(descriptions, label.Description)
+		}
+
+		gAnnotationQueue <- &ImageAnnotation{
+			image: canvasImage,
+			text:  strings.Join(descriptions, "\r\n"),
+		}
+	}
+}
+
+func mainLoop() {
+	url := serverURL + "/canvases/" + canvasId + "/images?subscribe"
+	for {
+		rawJsonStream := make(chan []byte)
+		go processRawJsonStream(rawJsonStream)
+		err := readStreamingEndpoint(url, rawJsonStream)
+		if apiErr, ok := err.(apiCallError); ok {
+			log.Print(apiErr.Error())
+			return // User needs to change config
+		}
+		// The network error, sleep and try again
+		const timeout = 3 * time.Second
+		log.Printf("Error %v, reconnect after %s", err.Error(), timeout)
+		time.Sleep(timeout)
+	}
+}
+
 func main() {
+	os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", gvisionKeyFile)
+
 	gImageDB = make(map[string]*ImageStatus)
-	doMainLoop()
+	gVisonQueue = make(chan *CanvasImage)
+	gAnnotationQueue = make(chan *ImageAnnotation)
+
+	go gvisionLoop()
+	go annotationLoop()
+
+	mainLoop()
 }
