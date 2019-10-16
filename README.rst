@@ -2,7 +2,7 @@
 Canvus Google Vision Demo
 =========================
 
-This simple demo shows how to use MT Canvus `Web API <https://apps.multitaction.com/mt-canvus/manual/server-installation/web-api.html>`_ in the streaming mode and do something useful with it. The code listens for the new images on  a given canvas and annotate every new image with labeles received from the Google Vision API.
+This simple demo shows how to use MT Canvus `Web API <https://apps.multitaction.com/mt-canvus/manual/server-installation/web-api.html>`_ in the streaming mode and do something useful with it. The code listens for the new images on  a given canvas and annotate every new image with labels received from the Google Vision API.
 
 ======
 How-to
