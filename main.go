@@ -19,7 +19,7 @@ const (
 	serverURL      = "http://localhost:8090/api/v1"
 	authToken      = "8W5zQ8nrSHe4NdBG"
 	canvasId       = "e90af7cf-2164-4ce3-b831-3fbb7d1449ae"
-	gvisionKeyFile = "/home/igor/SRC2/gvision_keys.json"
+	gvisionKeyFile = "/home/igor/gvision_keys.json"
 )
 
 type apiCallError struct {
