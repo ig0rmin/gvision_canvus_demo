@@ -24,4 +24,6 @@ How-to
 4. In the Canvus open the specified canvas and drop a new image. 
 
 
-
+.. image:: img/demo_.gif
+    :align: center
+    :scale: 100%
