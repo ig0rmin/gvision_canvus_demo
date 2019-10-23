@@ -109,8 +109,9 @@ type ImageStatus struct {
 }
 
 type ImageAnnotation struct {
-	image *CanvasImage
-	text  string
+	image  *CanvasImage
+	labels string
+	text   string
 }
 
 var gImageDB map[string]*ImageStatus
@@ -278,17 +279,17 @@ func annotateImage(image CanvasImage) {
 	gVisonQueue <- &image
 }
 
-func attachNote(image *CanvasImage, noteColor string, noteText string) {
+func attachNote(image *CanvasImage, noteColor string, relPosX, relPosY float64, noteText string) {
 	url := serverURL + "/canvases/" + canvasId + "/notes"
 
 	note_side := 300.0
 	note_scale := (image.Size.Height / 4.5) / note_side
 
-	pos_x := image.Size.Width - (note_side/2)*note_scale
+	pos_x := image.Size.Width - (note_side*relPosX)*note_scale
 	if pos_x < 0 {
 		pos_x = image.Size.Width
 	}
-	pos_y := image.Size.Height - (note_side*1.33)*note_scale
+	pos_y := image.Size.Height - (note_side*relPosY)*note_scale
 	if pos_y < 0 {
 		pos_y = image.Size.Height
 	}
@@ -349,7 +350,13 @@ Loop:
 			break Loop
 		}
 
-		attachNote(annotation.image, getMagicColor(), annotation.text)
+		if len(annotation.labels) > 0 {
+			attachNote(annotation.image, getMagicColor(), 0.5, 1.33, annotation.labels)
+		}
+
+		if len(annotation.text) > 0 {
+			attachNote(annotation.image, "#ffff66", 2.0, 0.7, annotation.text)
+		}
 	}
 }
 
@@ -371,8 +378,8 @@ Loop:
 		data, err := getImageDataStream(canvasImage.WidgetId)
 		if err != nil {
 			gAnnotationQueue <- &ImageAnnotation{
-				image: canvasImage,
-				text:  fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
+				image:  canvasImage,
+				labels: fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
 			}
 			continue Loop
 		}
@@ -380,17 +387,31 @@ Loop:
 		image, err := vision.NewImageFromReader(data)
 		if err != nil {
 			gAnnotationQueue <- &ImageAnnotation{
-				image: canvasImage,
-				text:  fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
+				image:  canvasImage,
+				labels: fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
 			}
 			continue Loop
+		}
+
+		texts, err := client.DetectTexts(ctx, image, nil, 10)
+		if err != nil {
+			gAnnotationQueue <- &ImageAnnotation{
+				image:  canvasImage,
+				labels: fmt.Sprintf("Can't get %s texts, error %s", canvasImage.WidgetId, err.Error()),
+			}
+			continue Loop
+		}
+
+		var text string
+		if len(texts) > 0 {
+			text = texts[0].Description
 		}
 
 		labels, err := client.DetectLabels(ctx, image, nil, 10)
 		if err != nil {
 			gAnnotationQueue <- &ImageAnnotation{
-				image: canvasImage,
-				text:  fmt.Sprintf("Can't get data stream of image %s, error: %s", canvasImage.WidgetId, err.Error()),
+				image:  canvasImage,
+				labels: fmt.Sprintf("Can't get %s labels, error: %s", canvasImage.WidgetId, err.Error()),
 			}
 			continue Loop
 		}
@@ -401,8 +422,9 @@ Loop:
 		}
 
 		gAnnotationQueue <- &ImageAnnotation{
-			image: canvasImage,
-			text:  strings.Join(descriptions, "\r\n"),
+			image:  canvasImage,
+			labels: strings.Join(descriptions, "\r\n"),
+			text:   text,
 		}
 	}
 }
